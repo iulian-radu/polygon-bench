@@ -1,0 +1,3 @@
+[submodule "client-jvm"]
+	path = client-jvm
+	url = git@github.com:iulian-radu/client-jvm.git

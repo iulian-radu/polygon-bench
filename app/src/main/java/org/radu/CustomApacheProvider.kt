@@ -15,7 +15,6 @@ open class CustomApacheProvider
 constructor() : HttpClientProvider {
 
     override fun buildClient(): HttpClient {
-        System.out.println("Created client");
         return  HttpClient(Apache) {
             install(WebSockets)
             install(JsonFeature) {

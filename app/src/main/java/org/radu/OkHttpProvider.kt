@@ -18,7 +18,6 @@ constructor() : HttpClientProvider {
     open fun buildEngine(): HttpClientEngine = OkHttp.create()
 
     override fun buildClient(): HttpClient {
-        System.out.println("Created client");
         return  HttpClient(OkHttp) {
             install(WebSockets)
             install(JsonFeature) {

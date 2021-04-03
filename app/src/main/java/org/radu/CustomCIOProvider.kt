@@ -15,7 +15,6 @@ open class CustomCIOProvider
 constructor() : HttpClientProvider {
 
     override fun buildClient(): HttpClient {
-        System.out.println("Created client");
         return  HttpClient(CIO) {
             install(WebSockets)
             install(JsonFeature) {

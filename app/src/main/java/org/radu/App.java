@@ -8,82 +8,260 @@ import io.polygon.kotlin.sdk.rest.PolygonRestClient;
 import io.polygon.kotlin.sdk.rest.reference.SupportedTickersParametersBuilder;
 import io.polygon.kotlin.sdk.rest.reference.TickersDTO;
 import okhttp3.*;
-import org.apache.commons.math3.stat.Frequency;
+import org.immutables.value.Value;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
-import java.util.concurrent.CountDownLatch;
-import java.util.function.Function;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+@Value.Immutable
+abstract class BenchmarkParameters {
+    abstract int getPage();
+    abstract int getTickersPerPage();
+    abstract Long getTimestamp();
+    abstract Semaphore getParallelismEnforcer();
+    abstract CountDownLatch getLatch();
+    abstract AtomicInteger getErrorCounter();
+    abstract Collection<Long> getExecTimes();
+}
+
+@Value.Immutable
+abstract class ResponseTimeInfo {
+    abstract double getMean();
+    abstract double getMedian();
+    abstract double getStandardDeviation();
+}
 
 public class App {
-    public static void main(String[] args) throws InterruptedException, IOException {
-        var key = System.getenv("POLYGON_API_KEY");
-        benchmark(new PolygonRestClient(key), "Default client");
-        benchmark(new PolygonRestClient(key, new CustomApacheProvider()), "Apache client - 1000 threads");
-        benchmark(new PolygonRestClient(key, new CustomCIOProvider()), "CIO client - 1000 threads");
-        benchmark(new PolygonRestClient(key, new OkHttpProvider()), "OkHttp client - 1000 threads");
+    private static int MAX_PAGE = 600;
+    private static String key = System.getenv("POLYGON_API_KEY");
 
-        benchmarkRawOkHttp(key);
+    public static void main(String[] args) throws InterruptedException, IOException {
+        var defaultClient = new PolygonRestClient(key);
+        var apacheClient = new PolygonRestClient(key, new CustomApacheProvider());
+        var cioClient = new PolygonRestClient(key, new CustomCIOProvider());
+        var okHttpClient = new PolygonRestClient(key, new OkHttpProvider());
+
+
+        var dispatcher = new Dispatcher();
+        dispatcher.setMaxRequests(1000);
+        dispatcher.setMaxRequestsPerHost(1000);
+        var rawOkHttpClient = new OkHttpClient.Builder()
+                .dispatcher(dispatcher)
+                .retryOnConnectionFailure(true)
+                .connectTimeout(20L, TimeUnit.SECONDS)
+                .writeTimeout(20L, TimeUnit.SECONDS)
+                .readTimeout(20L, TimeUnit.SECONDS)
+                .protocols(Arrays.asList(Protocol.HTTP_1_1))
+                .build();
+
+        ExecutorService executor = Executors.newFixedThreadPool(1000);
+
+        int numFetches = 1000;
+        List<Integer> parallelism = Arrays.asList(
+//                500
+                100
+//                10,
+//                1
+        );
+
+        for (Integer par : parallelism) {
+
+            // Custom implementation that calls OkHttp directly using its async dispatch. Does NOT use ktor
+            benchmark("Raw OkHttp async - par: " + par,
+                    (params) -> getPageWithRawOkHttpAsync(rawOkHttpClient, params), numFetches, par);
+
+            // custom implementation that calls OkHttp directly in a blocking fashion. Uses threads for parallelism. Does NOT use ktor
+            benchmark("Raw OkHttp blocking - par: " + par,
+                    (params) -> getPageWithRawOkHttpBlocking(rawOkHttpClient, params, executor), numFetches, par);
+
+            // Default client using async dispatch.
+//            benchmark("Default client async - par: " + par,
+//                    (params) -> getPageWithPolygonRestClientAsync(defaultClient, params), numFetches, par);
+            // Default client using blocking functions and threads for parallelism.
+//            benchmark("Default client blocking - par: " + par,
+//                    (params) -> getPageWithPolygonRestClientBlocking(defaultClient, params, executor), numFetches, par);
+            // Apache cient using async dispatch.
+            benchmark("Apache client - 1000 threads (async) - par: " + par,
+                    (params) -> getPageWithPolygonRestClientAsync(apacheClient, params), numFetches, par);
+            // Apache client using blocking functions and threads for parallelism.
+            benchmark("Apache client - 1000 threads (blocking) - par: " + par,
+                    (params) -> getPageWithPolygonRestClientBlocking(apacheClient, params, executor), numFetches, par);
+            benchmark("CIO client - 1000 threads (async) - par: " + par,
+                    (params) -> getPageWithPolygonRestClientAsync(cioClient, params), numFetches, par);
+            benchmark("CIO client - 1000 threads (blocking) - par: " + par,
+                    (params) -> getPageWithPolygonRestClientBlocking(cioClient, params, executor), numFetches, par);
+            benchmark("OkHttp client - 1000 threads (async) - par: " + par,
+                    (params) -> getPageWithPolygonRestClientAsync(okHttpClient, params), numFetches, par);
+            benchmark("OkHttp client - 1000 threads (blocking) - par: " + par,
+                    (params) -> getPageWithPolygonRestClientBlocking(okHttpClient, params, executor), numFetches, par);
+        }
+        executor.shutdown();
     }
 
-
-    private static void benchmark(PolygonRestClient client, String clientDescription) throws InterruptedException {
-        var refClient = client.getReferenceClient();
-        var params = new SupportedTickersParametersBuilder().tickersPerPage(200).page(1).build();
-//        var result = refClient.getSupportedTickersBlocking(new SupportedTickersParametersBuilder().page(1).tickersPerPage(1).build());
-        var numPages = 100; //(result.getCount() / params.getTickersPerPage()) + 1;
-        var latch = new CountDownLatch(numPages);
-        Frequency frequency = new Frequency();
-        Function<Long, PolygonRestApiCallback<TickersDTO>> getCallback =
-                (Long timestamp) -> new PolygonRestApiCallback<TickersDTO>() {
+    private static PolygonRestApiCallback<TickersDTO> getPolygonCallback(BenchmarkParameters parameters) {
+        return new PolygonRestApiCallback<TickersDTO>() {
             public void onError(Throwable throwable) {
                 computeDuration();
-                latch.countDown();
-                System.out.println("Error for page ???" + throwable);
+                parameters.getLatch().countDown();
+                parameters.getErrorCounter().incrementAndGet();
+                parameters.getParallelismEnforcer().release();
             }
 
             public long computeDuration() {
                 var end = System.currentTimeMillis();
-                var time = (end - timestamp) / 100;
-                frequency.addValue(time);
+                var time = end - parameters.getTimestamp();
+                parameters.getExecTimes().add(time);
                 return time;
             }
 
             public void onSuccess(TickersDTO t) {
                 computeDuration();
-                latch.countDown();
-              //  System.out.println("Fetched page " + t.getPage());
+                parameters.getLatch().countDown();
+                parameters.getParallelismEnforcer().release();
             }
         };
-        {
-            var startTime = System.nanoTime();
-            for (int i = 1; i <= numPages; ++i) {
-                var pars = new SupportedTickersParametersBuilder(params).page(i).build();
-                var callback = getCallback.apply(System.currentTimeMillis());
-                refClient.getSupportedTickers(pars, callback);
-            }
-            latch.await();
-            var endTime = System.nanoTime();
-            System.out.println(clientDescription + " (async) took " + (endTime - startTime) / 1000000.0 + " ms");
-            frequency.entrySetIterator().forEachRemaining(e -> System.out.println(e.getKey() + "00ms --> " + e.getValue()));
-        }
-        {
-            frequency.clear();
-            var startTime = System.nanoTime();
+    }
 
-            // reduced this to only 10 pages, as it takes a lot of time
-            for (int i = 1; i <= 10; ++i) {
-                var pars = new SupportedTickersParametersBuilder(params).page(i).build();
-                var start = System.currentTimeMillis();
-                refClient.getSupportedTickersBlocking(pars);
-                var end = System.currentTimeMillis();
-                var time = (end - start) / 100;
-                frequency.addValue(time);
-            }
-            var endTime = System.nanoTime();
-            System.out.println(clientDescription + " (sync) took " + (endTime - startTime) / 1000000.0 + " ms");
-            frequency.entrySetIterator().forEachRemaining(e -> System.out.println(e.getKey() + "00ms --> " + e.getValue()));
+    private static void getPageWithPolygonRestClientAsync(PolygonRestClient client, BenchmarkParameters parameters) {
+        try {
+            parameters.getParallelismEnforcer().acquire();
+            var params = new SupportedTickersParametersBuilder().tickersPerPage(parameters.getTickersPerPage()).page(parameters.getPage() % MAX_PAGE + 1).build();
+            client.getReferenceClient().getSupportedTickers(params, getPolygonCallback(ImmutableBenchmarkParameters.copyOf(parameters).withTimestamp(System.currentTimeMillis())));
+        } catch (InterruptedException ex) {
+            parameters.getErrorCounter().incrementAndGet();
         }
+    }
+
+    private static void getPageWithPolygonRestClientBlocking(PolygonRestClient client, BenchmarkParameters parameters, ExecutorService executor) {
+        try {
+            parameters.getParallelismEnforcer().acquire();
+            var start = System.currentTimeMillis();
+            var params = new SupportedTickersParametersBuilder().tickersPerPage(parameters.getTickersPerPage()).page(parameters.getPage() % MAX_PAGE + 1).build();
+            executor.execute(() -> {
+                try {
+                    client.getReferenceClient().getSupportedTickersBlocking(params);
+                    var end = System.currentTimeMillis();
+                    var time = end - start;
+                    parameters.getExecTimes().add(time);
+                } finally {
+                    parameters.getLatch().countDown();
+                    parameters.getParallelismEnforcer().release();
+                }
+            });
+       } catch (Exception ex) {
+            parameters.getErrorCounter().incrementAndGet();
+       }
+    }
+
+    private static Callback getOkHttpCallback(BenchmarkParameters parameters) {
+        return new Callback() {
+            @Override
+            public void onResponse(@NotNull Call call, @NotNull Response response) throws IOException {
+                response.close();
+                computeDuration();
+                parameters.getLatch().countDown();
+                parameters.getParallelismEnforcer().release();
+            }
+
+            @Override
+            public void onFailure(@NotNull Call call, @NotNull IOException e) {
+                System.out.println(e);
+                computeDuration();
+                parameters.getLatch().countDown();
+                parameters.getErrorCounter().incrementAndGet();
+                parameters.getParallelismEnforcer().release();
+            }
+
+            public long computeDuration() {
+                var end = System.currentTimeMillis();
+                var time = end - parameters.getTimestamp();
+                parameters.getExecTimes().add(time);
+                return time;
+            }
+        };
+    }
+
+    private static void getPageWithRawOkHttpAsync(OkHttpClient client, BenchmarkParameters parameters) {
+        try {
+            parameters.getParallelismEnforcer().acquire();
+            var params = new SupportedTickersParametersBuilder().tickersPerPage(parameters.getTickersPerPage()).page(parameters.getPage() % MAX_PAGE + 1).build();
+            client.newCall(getRequestForPage(parameters.getPage() % MAX_PAGE + 1, key)).enqueue(getOkHttpCallback(
+                    ImmutableBenchmarkParameters.copyOf(parameters).withTimestamp(System.currentTimeMillis())
+            ));
+        } catch (InterruptedException ex) {
+            parameters.getErrorCounter().incrementAndGet();
+        }
+    }
+
+    private static void getPageWithRawOkHttpBlocking(OkHttpClient client, BenchmarkParameters parameters, ExecutorService executor) {
+        try {
+            parameters.getParallelismEnforcer().acquire();
+            var start = System.currentTimeMillis();
+            executor.execute(() -> {
+                try {
+                    try(Response response = client.newCall(getRequestForPage(parameters.getPage() % MAX_PAGE + 1, key)).execute()) {
+                        var end = System.currentTimeMillis();
+                        var time = end - start;
+                        parameters.getExecTimes().add(time);
+                    }
+                } catch (Exception e) {
+                    parameters.getErrorCounter().incrementAndGet();
+                } finally {
+                    parameters.getLatch().countDown();
+                    parameters.getParallelismEnforcer().release();
+                }
+            });
+        } catch (Exception ex) {
+            parameters.getErrorCounter().incrementAndGet();
+        }
+    }
+
+    private static void benchmark(String clientDescription, Consumer<BenchmarkParameters> apiCaller,
+                                  int numFetches, int parallelism) throws InterruptedException {
+        var latch = new CountDownLatch(numFetches);
+        AtomicInteger errorCounter = new AtomicInteger(0);
+        Semaphore parallismEnforcer = new Semaphore(parallelism);
+        List<Long> execTimes = Collections.synchronizedList(new LinkedList<>());
+        var startTime = System.nanoTime();
+        BenchmarkParameters parameters = ImmutableBenchmarkParameters.builder()
+                .page(1)
+                .tickersPerPage(200)
+                .errorCounter(errorCounter)
+                .latch(latch)
+                .parallelismEnforcer(parallismEnforcer)
+                .timestamp(System.currentTimeMillis())
+                .execTimes(execTimes)
+                .build();
+        for (int i = 0; i < numFetches; ++i) {
+            apiCaller.accept(ImmutableBenchmarkParameters
+                            .copyOf(parameters)
+                            .withPage(i)
+                            .withTimestamp(System.currentTimeMillis()));
+        }
+        latch.await();
+        var endTime = System.nanoTime();
+        double timeInMs = (endTime - startTime) / 1000000.0;
+        System.out.println(clientDescription + " took " + timeInMs + " ms. " + (numFetches * 1000.0 / timeInMs) + " fetches / second");
+        ResponseTimeInfo histogram = computeHistogram(execTimes);
+        System.out.println("Mean: " + histogram.getMean() + " median: " + histogram.getMedian() + " std dev: " + histogram.getStandardDeviation());
+        System.out.println("Errors: " + errorCounter.get());
+    }
+
+    private static ResponseTimeInfo computeHistogram(Collection<Long> execTimes) {
+        Collection<Double> timesInSeconds = execTimes.stream().map(t -> t / 1000.0).collect(Collectors.toList());
+        Double median = timesInSeconds.stream().sorted().collect(Collectors.toList()).get(timesInSeconds.size() / 2);
+        Double mean = timesInSeconds.stream().reduce(0.0, Double::sum) / timesInSeconds.size();
+        Double stdDev = Math.sqrt(timesInSeconds.stream().map(t -> (t - mean) * (t - mean)).reduce(0.0, Double::sum) / timesInSeconds.size());
+        return ImmutableResponseTimeInfo.builder()
+                .mean(mean)
+                .median(median)
+                .standardDeviation(stdDev)
+                .build();
     }
 
     private static Request getRequestForPage(int page, String key) {
@@ -91,70 +269,4 @@ public class App {
                 .url("https://api.polygon.io/v2/reference/tickers?perpage=200&page=" + page + "&apiKey=" + key)
                 .build();
     }
-
-    private static void benchmarkRawOkHttp(String key) throws InterruptedException, IOException {
-        var dispatcher = new Dispatcher();
-        dispatcher.setMaxRequests(1000);
-        dispatcher.setMaxRequestsPerHost(1000);
-        var okHttpClient = new OkHttpClient.Builder()
-                .dispatcher(dispatcher)
-                .retryOnConnectionFailure(true)
-                .build();
-
-        int numPages = 100;
-
-        var latch = new CountDownLatch(numPages);
-        Frequency frequency = new Frequency();
-        Function<Long, Callback> getCallback =
-                (Long timestamp) -> new Callback() {
-                    @Override
-                    public void onFailure(@NotNull Call call, @NotNull IOException e) {
-                        computeDuration();
-                        latch.countDown();
-                        System.out.println("Error for page ???" + e);
-                    }
-
-                    public long computeDuration() {
-                        var end = System.currentTimeMillis();
-                        var time = (end - timestamp) / 100;
-                        frequency.addValue(time);
-                        return time;
-                    }
-
-                    @Override
-                    public void onResponse(@NotNull Call call, @NotNull Response response) throws IOException {
-                        computeDuration();
-                        latch.countDown();
-                        //  System.out.println("Fetched page " + t.getPage());
-                    }
-                };
-        {
-            var startTime = System.nanoTime();
-            for (int i = 1; i <= numPages; ++i) {
-                okHttpClient.newCall(getRequestForPage(i, key)).enqueue(getCallback.apply(System.currentTimeMillis()));
-            }
-            latch.await();
-            var endTime = System.nanoTime();
-            System.out.println("Direct OkHttp call " + " (async) took " + (endTime - startTime) / 1000000.0 + " ms");
-            frequency.entrySetIterator().forEachRemaining(e -> System.out.println(e.getKey() + "00ms --> " + e.getValue()));
-        }
-        {
-            frequency.clear();
-            var startTime = System.nanoTime();
-
-            // reduced this to only 10 pages, as it takes a lot of time
-            for (int i = 1; i <= 10; ++i) {
-                var start = System.currentTimeMillis();
-                okHttpClient.newCall(getRequestForPage(i, key)).execute();
-                var end = System.currentTimeMillis();
-                var time = (end - start) / 100;
-                frequency.addValue(time);
-            }
-            var endTime = System.nanoTime();
-            System.out.println("Direct OkHttp call " + " (sync) took " + (endTime - startTime) / 1000000.0 + " ms");
-            frequency.entrySetIterator().forEachRemaining(e -> System.out.println(e.getKey() + "00ms --> " + e.getValue()));
-        }
-
-    }
-
 }
